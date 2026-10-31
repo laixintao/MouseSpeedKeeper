@@ -6,7 +6,17 @@ enum Failure: Error, CustomStringConvertible {
     var description: String { switch self { case .message(let s): return s } }
 }
 
-final class HIDConnection {
+protocol HIDRequesting {
+    func request(slot: UInt8, feature: UInt8, function: UInt8, params: [UInt8], attempts: Int) throws -> [UInt8]
+}
+
+extension HIDRequesting {
+    func request(slot: UInt8, feature: UInt8, function: UInt8, params: [UInt8] = []) throws -> [UInt8] {
+        try request(slot: slot, feature: feature, function: function, params: params, attempts: 3)
+    }
+}
+
+final class HIDConnection: HIDRequesting {
     let device: IOHIDDevice
     let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
     var reports: [[UInt8]] = []
@@ -26,7 +36,7 @@ final class HIDConnection {
         IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
         buffer.deallocate()
     }
-    func request(slot: UInt8, feature: UInt8, function: UInt8, params: [UInt8] = [], attempts: Int = 3) throws -> [UInt8] {
+    func request(slot: UInt8, feature: UInt8, function: UInt8, params: [UInt8], attempts: Int) throws -> [UInt8] {
         var lastError: Error = Failure.message("No response")
         for _ in 0..<attempts {
             do { return try exchange(slot: slot, feature: feature, function: function, params: params) }
@@ -56,8 +66,56 @@ final class HIDConnection {
     }
 }
 
+enum ScrollMode: String, Codable {
+    case ratchet
+    case freeSpin
+}
+
+struct ScrollState: CustomStringConvertible {
+    let mode: UInt8
+    let autoDisengage: UInt8
+
+    func matches(_ target: ScrollMode) -> Bool {
+        switch target {
+        case .ratchet: return mode == 2 && autoDisengage == 255
+        case .freeSpin: return mode == 1
+        }
+    }
+
+    var description: String {
+        if mode == 1 { return "freeSpin" }
+        return autoDisengage == 255 ? "ratchet" : "smartShift(threshold=\(autoDisengage))"
+    }
+}
+
+struct ScrollWheel {
+    let connection: HIDRequesting
+    let slot: UInt8
+    let feature: UInt8
+    let enhanced: Bool
+
+    func state() throws -> ScrollState {
+        let reply = try connection.request(slot: slot, feature: feature, function: enhanced ? 1 : 0)
+        guard reply.count >= 6, [1, 2].contains(reply[4]) else {
+            throw Failure.message("Invalid SmartShift wheel status")
+        }
+        return ScrollState(mode: reply[4], autoDisengage: reply[5])
+    }
+
+    func setMode(_ mode: ScrollMode) throws {
+        // HID++ 0x2110 / 0x2111: mode 2 enables ratcheting; threshold 255
+        // disables automatic disengagement. Zero leaves other settings unchanged:
+        // byte 3 is the default threshold (0x2110) or ratchet torque (0x2111).
+        let params: [UInt8] = mode == .ratchet ? [2, 255, 0] : [1, 0, 0]
+        _ = try connection.request(slot: slot, feature: feature, function: enhanced ? 2 : 1, params: params)
+        guard try state().matches(mode) else {
+            throw Failure.message("Mouse did not retain requested scroll mode \(mode.rawValue)")
+        }
+    }
+}
+
 struct Mouse {
-    let connection: HIDConnection
+    let connection: HIDRequesting
     let slot: UInt8
     let feature: UInt8
     let identity: String
@@ -70,6 +128,17 @@ struct Mouse {
         _ = try connection.request(slot: slot, feature: feature, function: 3,
                                    params: [0, UInt8(value >> 8), UInt8(value & 255)])
         guard try dpi() == value else { throw Failure.message("Mouse did not retain requested DPI") }
+    }
+
+    func scrollWheel() throws -> ScrollWheel? {
+        // Prefer SmartShift Enhanced; older models expose only SmartShift.
+        for id: UInt16 in [0x2111, 0x2110] {
+            let reply = try connection.request(slot: slot, feature: 0, function: 0,
+                                               params: [UInt8(id >> 8), UInt8(id & 255)])
+            guard reply[4] != 0 else { continue }
+            return ScrollWheel(connection: connection, slot: slot, feature: reply[4], enhanced: id == 0x2111)
+        }
+        return nil
     }
 }
 
@@ -103,22 +172,42 @@ func discover() throws -> [Mouse] {
 struct Configuration: Codable {
     let identity: String
     let dpi: Int
+    var scrollMode: ScrollMode? = nil
+}
+
+func restore(_ config: Configuration, on mouse: Mouse, force: Bool = false) throws {
+    var wheel: ScrollWheel?
+    var wheelState: ScrollState?
+    if config.scrollMode != nil {
+        guard let supportedWheel = try mouse.scrollWheel() else {
+            throw Failure.message("Configured mouse does not support SmartShift scroll mode (0x2110/0x2111)")
+        }
+        wheel = supportedWheel
+        wheelState = try supportedWheel.state()
+    }
+
+    let current = try mouse.dpi()
+    if force || current != config.dpi {
+        try mouse.setDPI(config.dpi)
+        print("\(Date()): verified DPI \(current) -> \(config.dpi)")
+        fflush(stdout)
+    }
+    if let target = config.scrollMode, let wheel, let wheelState, force || !wheelState.matches(target) {
+        try wheel.setMode(target)
+        print("\(Date()): verified scroll mode \(wheelState) -> \(target.rawValue)")
+        fflush(stdout)
+    }
 }
 
 func restore(_ config: Configuration, force: Bool = false) throws -> Bool {
     for mouse in try discover() where mouse.identity == config.identity {
-        let current = try mouse.dpi()
-        if force || current != config.dpi {
-            try mouse.setDPI(config.dpi)
-            print("\(Date()): verified DPI \(current) -> \(config.dpi)")
-            fflush(stdout)
-        }
+        try restore(config, on: mouse, force: force)
         return true
     }
     return false
 }
 
-do {
+func runCLI() throws {
     let args = Array(CommandLine.arguments.dropFirst())
     let command = args.first ?? "probe"
     switch command {
@@ -126,7 +215,18 @@ do {
         let mice = try discover()
         guard !mice.isEmpty else { throw Failure.message("No accessible Logitech mouse with adjustable DPI found. Wake the mouse and check Input Monitoring permission.") }
         if command == "probe" {
-            for mouse in mice { print("id=\(mouse.identity) slot=\(mouse.slot) dpi=\(try mouse.dpi())") }
+            for mouse in mice {
+                let dpi = try mouse.dpi()
+                let scroll: String
+                do {
+                    if let wheel = try mouse.scrollWheel() { scroll = try wheel.state().description }
+                    else { scroll = "unsupported" }
+                } catch {
+                    scroll = "unavailable"
+                    fputs("Scroll mode query failed for \(mouse.identity): \(error)\n", stderr)
+                }
+                print("id=\(mouse.identity) slot=\(mouse.slot) dpi=\(dpi) scroll=\(scroll)")
+            }
         } else {
             guard args.count == 2, mice.count == 1 else { throw Failure.message("Usage: mouse-speed capture CONFIG.json (exactly one mouse must be connected)") }
             let config = Configuration(identity: mice[0].identity, dpi: try mice[0].dpi())
@@ -162,7 +262,17 @@ do {
     default:
         throw Failure.message("Usage: mouse-speed [probe | capture CONFIG.json | apply CONFIG.json | watch CONFIG.json]")
     }
-} catch {
-    fputs("\(error)\n", stderr)
-    exit(1)
 }
+
+#if !TESTING
+@main
+struct MouseSpeedKeeper {
+    static func main() {
+        do { try runCLI() }
+        catch {
+            fputs("\(error)\n", stderr)
+            exit(1)
+        }
+    }
+}
+#endif

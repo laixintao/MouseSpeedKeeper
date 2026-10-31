@@ -2,4 +2,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .build
-swiftc -O -module-cache-path "$PWD/.build/module-cache" Sources/MouseSpeed.swift -o .build/mouse-speed
+swiftc -O -parse-as-library -module-cache-path "$PWD/.build/module-cache" Sources/MouseSpeed.swift -o .build/mouse-speed

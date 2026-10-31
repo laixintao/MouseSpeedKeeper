@@ -1,8 +1,8 @@
 # MouseSpeedKeeper
 
-macOS 上的轻量 Logitech 硬件 DPI 保持工具。Swift 直接使用系统 IOKit 和 HID++ 2.0 Adjustable DPI（0x2201），不依赖 Options+ 或第三方运行时。
+macOS 上的轻量 Logitech 硬件 DPI 与滚轮模式保持工具。Swift 直接使用系统 IOKit 和 HID++ 2.0，不依赖 Options+ 或第三方运行时。
 
-只修改选定鼠标的硬件 DPI，不修改 macOS 指针速度、加速度、触控板、按键或滚轮。通过设备 Unit ID 匹配鼠标。
+通过设备 Unit ID 匹配鼠标，默认只保持硬件 DPI；可选固定滚轮为有段落感或自由滚动。不修改 macOS 指针速度、加速度、触控板或按键。
 
 ## Homebrew 安装
 
@@ -64,6 +64,29 @@ mouse-speed probe
 
 后台是一个持续运行的 Swift 进程：每轮查找鼠标、读取 DPI，仅在与目标值不同时设置并读回验证，之后休眠 5 秒。设备探测超时会延长实际检查间隔，不会每 5 秒启动 Python。
 
+## 固定滚轮为有段落感
+
+在同一配置文件中加入 `"scrollMode": "ratchet"`，保留自己的 `identity` 和 `dpi`：
+
+```json
+{
+  "dpi": 2200,
+  "identity": "1234abcd",
+  "scrollMode": "ratchet"
+}
+```
+
+重启服务后用 `mouse-speed probe` 检查，输出应包含 `scroll=ratchet`：
+
+```sh
+brew services restart mouse-speed-keeper
+mouse-speed probe
+```
+
+`ratchet` 会关闭 SmartShift 自动脱离段落模式，快速拨动也保持段落感；不会更改滚轮阻力。按模式切换键或其他软件改变模式后，watch 会在下一轮恢复。也支持 `"freeSpin"`（自由滚动）。删除 `scrollMode` 后重启可停止管理滚轮，但不会还原先前的 SmartShift 设置。
+
+需要鼠标支持 SmartShift（0x2110）或 SmartShift Enhanced（0x2111）。不支持时会明确报错。原有配置不需要修改，`capture` 仍只捕获设备 ID 和 DPI；滚轮控制必须手动启用。
+
 ## 状态与日志
 
 ```sh
@@ -75,7 +98,7 @@ tail -n 30 "$HOME/Library/Application Support/MouseSpeedKeeper/agent.log" \
   "$HOME/Library/Application Support/MouseSpeedKeeper/error.log"
 ```
 
-配置与日志位于 `~/Library/Application Support/MouseSpeedKeeper/`。服务标签固定为 `homebrew.mxcl.mouse-speed-keeper`，程序由 Homebrew 管理。DPI 没有变化时不会持续输出成功日志。
+配置与日志位于 `~/Library/Application Support/MouseSpeedKeeper/`。服务标签固定为 `homebrew.mxcl.mouse-speed-keeper`，程序由 Homebrew 管理。受管理的设置没有变化时不会持续输出成功日志。
 
 ## 升级、停止与卸载
 
@@ -103,15 +126,16 @@ brew services stop mouse-speed-keeper
 brew uninstall mouse-speed-keeper
 ```
 
-卸载保留配置与日志，不还原硬件 DPI，不操作 Logitech 服务。
+卸载保留配置与日志，不还原硬件 DPI 或滚轮模式，不操作 Logitech 服务。
 
 ## 兼容性与排障
 
-实机验证环境为 macOS 15、MX Anywhere 3S + Logi Bolt USB 接收器。其他型号、蓝牙直连、真实重启、接收器拔插和睡眠唤醒需分别验证。设备必须提供 0x2201 和非零 Unit ID。
+DPI 的实机验证环境为 macOS 15、MX Anywhere 3S + Logi Bolt USB 接收器；该鼠标已验证从自由滚动切到固定段落模式并读回。两代滚轮协议均有模拟测试。其他型号、蓝牙直连、真实重启、接收器拔插和睡眠唤醒需分别验证。设备必须提供 Adjustable DPI（0x2201）和非零 Unit ID。
 
 - 找不到设备：检查电源、接收器、鼠标是否唤醒及兼容性。
 - 无法打开 HID：检查系统设置 → 隐私与安全性 → 输入监控，必要时允许 Homebrew 安装的 `mouse-speed`，注销再登录。工具不绕过权限。
 - DPI 来回变化：检查是否运行了多个 watch，或 Options+ 是否设置了不同值。本工具不替代 Options+ 的按键映射等功能。
+- 滚轮模式未生效：确认配置包含 `scrollMode`，并使用支持该选项的新版程序；旧版本会忽略此字段。检查 probe 的滚轮状态和服务错误日志。
 
 完整配置格式、CLI、日志和测试说明见 [配置文档](docs/configuration.md)。
 
@@ -129,6 +153,12 @@ Homebrew 的无硬件测试：
 
 ```sh
 brew test laixintao/tap/mouse-speed-keeper
+```
+
+源码的无硬件协议测试（配置兼容、两代 SmartShift、自动恢复与读回失败）：
+
+```sh
+bash scripts/test.sh
 ```
 
 `scripts/check-recovery.py` 是可选的有副作用测试，会短暂改变 DPI。执行前阅读配置文档，不要把它作为安装步骤。

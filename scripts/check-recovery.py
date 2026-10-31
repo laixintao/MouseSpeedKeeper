@@ -13,6 +13,7 @@ root = pathlib.Path(__file__).resolve().parent.parent
 binary = root / '.build/mouse-speed'
 original = root / 'mouse-config.json'
 config = json.loads(original.read_text())
+config = {key: config[key] for key in ('identity', 'dpi')}
 
 def run(*args):
     result = subprocess.run([str(binary), *map(str, args)],
@@ -23,7 +24,9 @@ def run(*args):
 
 with tempfile.TemporaryDirectory(prefix='mouse-speed-check-') as directory:
     temporary = pathlib.Path(directory) / 'offset.json'
+    baseline = pathlib.Path(directory) / 'baseline.json'
     observed = pathlib.Path(directory) / 'observed.json'
+    baseline.write_text(json.dumps(config))
     temporary.write_text(json.dumps({**config, 'dpi': config['dpi'] + 100}))
     try:
         print(run('apply', temporary), flush=True)
@@ -39,4 +42,4 @@ with tempfile.TemporaryDirectory(prefix='mouse-speed-check-') as directory:
             raise RuntimeError('Background DPI recovery was not observed')
         print(f"PASS: background agent restored {config['dpi']} DPI", flush=True)
     finally:
-        print(run('apply', original), flush=True)
+        print(run('apply', baseline), flush=True)
